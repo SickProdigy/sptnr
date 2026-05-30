@@ -15,7 +15,7 @@ This script was developed as a solution to repurpose the star ratings in Navidro
 7. [Examples](#examples)
 8. [Resuming Interrupted Sessions](#resuming-interrupted-sessions)
 9. [Managing Docker Containers](#managing-docker-containers)
-10. [Mapping Spotify Popularity to Navidrome Ratings](#mapping-spotify-popularity-to-navidrome-ratings)
+10. [Mapping Spotify/Lastfm/MusicBrainz Popularity to Navidrome Ratings](#mapping-provider-scores-to-navidrome-ratings)
 11. [Estimated Processing Times](#estimated-processing-times)
 12. [Importance of Accurate Metadata for Track Lookup](#importance-of-accurate-metadata-for-track-lookup)
 13. [Logs](#logs)
@@ -23,8 +23,11 @@ This script was developed as a solution to repurpose the star ratings in Navidro
 ## Features
 
 - **Spotify Integration**: Connects to Spotify's API to fetch popularity data for tracks.
-- **Navidrome Integration**: Updates track ratings in Navidrome based on Spotify popularity.
+- **Last.fm Support**: Can use Last.fm artist top-track position, listeners, and playcounts as an alternate popularity source. (This is a great option from spotify, will pull ratings on most songs.)
+- **MusicBrainz Support**: Can use MusicBrainz community ratings as a third rating source. (Currently not a lot of ratings available, but worth having as an option for the future.)
+- **Navidrome Integration**: Updates track ratings in Navidrome based on provider scores.
 - **Flexible Processing**: Process specific artists, albums, or a range of artists or albums.
+- **Unrated-Only Mode**: Skip tracks that already have a rating and only update unrated songs.
 - **Preview Mode**: Run the script in preview mode to see changes without making any actual updates.
 - **Logging**: Detailed logging of the process, both in the console and to a file.
 - **Docker Support**: Run the script in a Docker container for consistent environments and ease of use.
@@ -32,8 +35,9 @@ This script was developed as a solution to repurpose the star ratings in Navidro
 ## Requirements
 
 - Python 3.x or Docker
-- A Spotify Developer account with an API key ([Get your Spotify API key here](https://developer.spotify.com/dashboard/create))
 - Access to a Navidrome server
+- Optional: A Spotify Developer account with an API key ([Get your Spotify API key here](https://developer.spotify.com/dashboard/create))
+- Optional: a Last.fm API key if you want to use Last.fm as the popularity provider
 
 **Compatibility Note**: While this script was built with Navidrome in mind, it should theoretically work on any Subsonic server. If you successfully use it with other Subsonic servers, please open an issue to let me know, so I can document it and assist others.
 
@@ -50,6 +54,8 @@ docker run -t \
   -e SPOTIFY_CLIENT_SECRET=your_spotify_client_secret \
   krestaino/sptnr:latest
 ```
+
+If you want to use Last.fm instead of Spotify, add `-e LASTFM_API_KEY=your_lastfm_api_key` and run with `--provider lastfm`.
 
 **Note**: The `-t` flag is used to allocate a pseudo-terminal which assists in displaying colored and bold text in the terminal output, which this script uses.
 
@@ -138,7 +144,9 @@ The script supports various options for flexible usage. Below are examples of ho
 - `-b, --album ALBUM_ID`: Process a specific album. Multiple albums can be specified.
 - `-s, --start START_INDEX`: Start processing from the artist at the specified index (0-based).
 - `-l, --limit LIMIT`: Limit the processing to a specific number of artists from the start index.
-- `-d, --cache-duration DURATION`: Number of days to cache song updates (0 to force update every time).
+- `-d, --lock-duration DURATION`: Number of days to lock song updates (0 to force update every time).
+- `--provider spotify|lastfm|musicbrainz`: Choose the source used to derive the rating. Spotify is the default.
+- `--unrated-only`: Only update songs that do not already have a Navidrome rating.
 
 ### Command Formats
 
@@ -188,6 +196,32 @@ The script supports various options for flexible usage. Below are examples of ho
   - Docker Compose: `docker-compose run sptnr -s 10 -l 5`
   - Docker Run: `docker run -t [env vars] krestaino/sptnr:latest -s 10 -l 5`
 
+- **Only Update Unrated Songs**:
+   Skip tracks that already have a rating in Navidrome.
+   - Python: `python sptnr.py --unrated-only`
+   - Docker Compose: `docker-compose run sptnr --unrated-only`
+   - Docker Run: `docker run -t [env vars] krestaino/sptnr:latest --unrated-only`
+
+- **Use Last.fm as the Provider**:
+   Use Last.fm artist top-track position, listener, and playcount data instead of Spotify popularity.
+   - Python: `LASTFM_API_KEY=... python sptnr.py --provider lastfm`
+   - Docker Compose: `docker-compose run -e LASTFM_API_KEY=... sptnr --provider lastfm`
+   - Docker Run: `docker run -t -e LASTFM_API_KEY=... [env vars] krestaino/sptnr:latest --provider lastfm`
+
+   Last.fm does not provide a Spotify-style popularity number, so the script derives one from three signals:
+
+   - **Artist top-track position**: where the track appears in Last.fm's `artist.getTopTracks` results for that artist. This is the largest part of the score.
+   - **Listener reach**: the track's unique Last.fm listener count, scaled logarithmically.
+   - **Replay engagement**: plays per listener, used as a small capped bonus.
+
+   This keeps ordinary catalog tracks mostly in the 2-3 star range while letting occasional artist standouts reach 4-5 stars.
+
+- **Use MusicBrainz as the Provider**:
+   Use MusicBrainz ratings to derive the same 0-5 Navidrome rating.
+   - Python: `python sptnr.py --provider musicbrainz`
+   - Docker Compose: `docker-compose run sptnr --provider musicbrainz`
+   - Docker Run: `docker run -t [env vars] krestaino/sptnr:latest --provider musicbrainz`
+
 ## Resuming Interrupted Sessions
 
 In cases where your session gets interrupted - for instance, if your machine goes to sleep, you encounter rate limits from Spotify, or for any other reason that causes the script to not complete - you have the option to resume from where you left off.
@@ -214,9 +248,18 @@ In this project, `docker-compose run` is used instead of `docker-compose up`. Th
 docker container prune
 ```
 
-## Mapping Spotify Popularity to Navidrome Ratings
+## Mapping Provider Scores to Navidrome Ratings
 
-The script translates Spotify's popularity metric, which ranges from 0 to 100, into Navidrome's 5-star rating system. This conversion allows you to quickly gauge a track's popularity on Spotify directly within Navidrome. The mapping is as follows:
+The script translates provider scores into Navidrome's 5-star rating system. Each provider gets its score a little differently:
+
+- **Spotify**: Uses Spotify's native track `popularity` value, which is already a 0 to 100 score.
+- **Last.fm**: Derives a 0 to 100 score from three signals:
+  - artist top-track position from Last.fm's `artist.getTopTracks` results
+  - listener reach from the track's unique listener count
+  - replay engagement from plays per listener
+- **MusicBrainz**: Reads the community recording rating from MusicBrainz's recording lookup endpoint. MusicBrainz ratings are already on a 0 to 5 scale, so they are rounded directly to Navidrome's 0 to 5 rating range instead of using the 0 to 100 mapping below.
+
+For Spotify and Last.fm, the resulting 0 to 100 score is mapped as follows:
 
 - **0 to 16**: Mapped to 0 stars in Navidrome (Not popular)
 - **17 to 33**: Mapped to 1 star (Low popularity)
@@ -241,16 +284,16 @@ These estimates are based on the script's performance with my library of 6,481 t
 
 ## Importance of Accurate Metadata for Track Lookup
 
-The effectiveness of this script heavily relies on the accuracy of the artist, album, and track titles in your music library. For Spotify to successfully recognize and match songs, these metadata details need to be precise.
+The effectiveness of this script heavily relies on the accuracy of the artist, album, and track titles in your music library. For the supported providers to successfully recognize and match songs, these metadata details need to be precise.
 
-I personally recommend using **MusicBrainz** to tag your music library. MusicBrainz is a comprehensive music database that provides reliable and standardized music metadata, which significantly enhances the accuracy of track matching with Spotify.
+I personally recommend using **MusicBrainz** to tag your music library. MusicBrainz is a comprehensive music database that provides reliable and standardized music metadata, which significantly enhances the accuracy of track matching with any of the supported providers.
 
 However, it's important to acknowledge that even with a perfectly tagged MusicBrainz library, discrepancies can still occur between Spotify and MusicBrainz data. This may result in the script missing some songs during the matching process.
 
 To give you an idea of the matching accuracy you can expect, here are some statistics from my own library, which is tagged using MusicBrainz:
 
 - **Total Tracks**: 6,481
-- **Tracks Found on Spotify**: 6,390
+- **Tracks Matched**: 6,390
 - **Tracks Not Found**: 91
 - **Match Percentage**: 98.6%
 
@@ -262,9 +305,9 @@ Logs are stored in the `logs` directory, and each script execution creates a new
 
 The script logs its actions in a straightforward format, using `p:49 → r:2` to summarize operations:
 
-- `p:49` indicates the Spotify popularity score, where `49` is the specific score.
+- `p:49` indicates the provider score, where `49` is the specific score.
 - `→` symbolizes the mapping performed by the script.
-- `r:2` shows the Navidrome rating assigned based on the Spotify score.
+- `r:2` shows the Navidrome rating assigned based on the provider score.
 
 ### Terminal Output Colors
 
