@@ -145,6 +145,8 @@ The script supports various options for flexible usage. Below are examples of ho
 - `-s, --start START_INDEX`: Start processing from the artist at the specified index (0-based).
 - `-l, --limit LIMIT`: Limit the processing to a specific number of artists from the start index.
 - `-d, --lock-duration DURATION`: Number of days to lock song updates (0 to force update every time).
+- `--navidrome-retries RETRIES`: Number of attempts for Navidrome API requests. Defaults to 3.
+- `--navidrome-timeout SECONDS`: Base timeout for Navidrome API requests. Defaults to 10 seconds and increases on each retry.
 - `--provider spotify|lastfm|musicbrainz`: Choose the source used to derive the rating. Spotify is the default.
 - `--unrated-only`: Only update songs that do not already have a Navidrome rating.
 
@@ -201,6 +203,12 @@ The script supports various options for flexible usage. Below are examples of ho
    - Python: `python sptnr.py --unrated-only`
    - Docker Compose: `docker-compose run sptnr --unrated-only`
    - Docker Run: `docker run -t [env vars] krestaino/sptnr:latest --unrated-only`
+
+- **Tolerate Slow Navidrome Scans**:
+   Retry Navidrome API calls and increase the timeout for each retry.
+   - Python: `python sptnr.py --navidrome-retries 3 --navidrome-timeout 10`
+   - Docker Compose: `docker-compose run sptnr --navidrome-retries 3 --navidrome-timeout 10`
+   - Docker Run: `docker run -t [env vars] krestaino/sptnr:latest --navidrome-retries 3 --navidrome-timeout 10`
 
 - **Use Last.fm as the Provider**:
    Use Last.fm artist top-track position, listener, and playcount data instead of Spotify popularity.
