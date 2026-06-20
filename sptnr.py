@@ -132,11 +132,31 @@ def save_lock(lock):
         tempname = tf.name
     os.replace(tempname, LOCK_FILE)
 
+
+# Lock entries used to be stored as plain timestamps. Newer entries include the
+# timestamp plus track context, so this keeps old lock files compatible.
+def get_lock_timestamp(lock_entry):
+    if isinstance(lock_entry, dict):
+        return lock_entry.get("updated_at") or lock_entry.get("timestamp")
+    return lock_entry
+
+
+# Store enough context in the lock file to identify what was updated. That makes
+# long interrupted runs easier to inspect without changing the lock behavior.
+def record_lock(track_id, artist_name, album, track_name):
+    LOCK[track_id] = {
+        "updated_at": time.time(),
+        "artist_name": artist_name,
+        "album": album,
+        "track_name": track_name,
+    }
+    save_lock(LOCK)
+
 def should_update(song_id):
     lock_expiry_seconds = get_lock_expiry()
     if lock_expiry_seconds == 0:
         return True
-    last_update_ts = LOCK.get(song_id)
+    last_update_ts = get_lock_timestamp(LOCK.get(song_id))
     if not last_update_ts:
         return True
     return (time.time() - last_update_ts) > lock_expiry_seconds
@@ -162,6 +182,16 @@ logging.basicConfig(level=logging.INFO, handlers=[console_handler])
 file_handler = logging.FileHandler(LOGFILE, "a", encoding="ascii", errors="backslashreplace")
 file_handler.setFormatter(SafeAsciiFormatter("[%(asctime)s] %(message)s"))
 logging.getLogger().addHandler(file_handler)
+
+
+def log_unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logging.error("Unhandled error during sync", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+sys.excepthook = log_unhandled_exception
 
 # Authentication
 spotify_token_manager = None
@@ -247,6 +277,18 @@ parser.add_argument(
     action="store_true",
     help="Only update songs that do not already have a Navidrome rating",
 )
+parser.add_argument(
+    "--navidrome-retries",
+    type=int,
+    default=3,
+    help="Number of attempts for Navidrome API requests",
+)
+parser.add_argument(
+    "--navidrome-timeout",
+    type=int,
+    default=10,
+    help="Base timeout in seconds for Navidrome API requests; each retry increases it",
+)
 
 parser.add_argument(
     "-v", "--version", action="version", version=f"%(prog)s {__version__}"
@@ -263,6 +305,10 @@ BASE_LOCK_DURATION = args.lock_duration
 LOCK_JITTER = args.lock_jitter
 PROVIDER = args.provider
 UNRATED_ONLY = args.unrated_only
+# Navidrome scans can make the API temporarily slow or busy. These settings let
+# long syncs wait out short scan-related stalls instead of aborting the run.
+NAVIDROME_RETRIES = max(1, args.navidrome_retries)
+NAVIDROME_TIMEOUT = max(1, args.navidrome_timeout)
 
 # Build only the provider-specific client we actually need.
 if PROVIDER == "spotify":
@@ -338,12 +384,52 @@ def get_rating_from_popularity(provider_popularity):
         return 5
 
 
+def navidrome_get(url, context, max_retries=None, base_timeout=None):
+    # Shared retry wrapper for Navidrome's Subsonic API calls. This covers reads
+    # and rating writes, which may time out while Navidrome is scanning the library.
+    max_retries = max_retries or NAVIDROME_RETRIES
+    base_timeout = base_timeout or NAVIDROME_TIMEOUT
+
+    for attempt in range(max_retries):
+        # Increase the timeout each attempt so brief stalls retry quickly while a
+        # scan-heavy server still gets a longer chance to respond before we fail.
+        timeout = base_timeout * (attempt + 1)
+        try:
+            response = requests.get(url, timeout=timeout)
+
+            if response.status_code >= 500:
+                wait_time = (attempt + 1) * 2
+                logging.warning(
+                    f"Navidrome server error {response.status_code} while {context}. "
+                    f"Attempt {attempt + 1}/{max_retries}. Waiting {wait_time}s..."
+                )
+                time.sleep(wait_time)
+                continue
+
+            response.raise_for_status()
+            return response
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            wait_time = (attempt + 1) * 2
+            logging.warning(
+                f"Connection error while {context}: {e}. "
+                f"Attempt {attempt + 1}/{max_retries} with timeout {timeout}s. Waiting {wait_time}s..."
+            )
+            time.sleep(wait_time)
+            continue
+        except requests.exceptions.RequestException:
+            raise
+
+    raise requests.exceptions.Timeout(
+        f"Navidrome request failed after {max_retries} attempts while {context}"
+    )
+
+
 # Read the current Navidrome rating for this track so unrated-only mode can skip already-rated songs.
 def get_existing_rating(track_id):
     nav_url = f"{NAV_BASE_URL}/rest/getSong?id={track_id}&u={NAV_USER}&p=enc:{HEX_ENCODED_PASS}&v=1.12.0&c=myapp&f=json"
     try:
-        response = requests.get(nav_url, timeout=5)
-        response.raise_for_status()
+        response = navidrome_get(nav_url, f"reading existing rating for {track_id}")
         data = response.json()
         song = data["subsonic-response"]["song"]
         rating_value = song.get("rating", song.get("userRating", 0))
@@ -835,10 +921,9 @@ def process_track(track_id, artist_name, album, track_name):
         elif PREVIEW != 1:
             try:
                 nav_url = f"{NAV_BASE_URL}/rest/setRating?u={NAV_USER}&p=enc:{HEX_ENCODED_PASS}&v=1.12.0&c=myapp&id={track_id}&rating={navidrome_rating}"
-                requests.get(nav_url, timeout=5)
+                navidrome_get(nav_url, f"updating rating for {track_id}")
                 FOUND_AND_UPDATED += 1
-                LOCK[track_id] = time.time()
-                save_lock(LOCK)
+                record_lock(track_id, artist_name, album, track_name)
             except requests.exceptions.RequestException as e:
                 logging.error(f"Failed to update rating in Navidrome: {e}")
     else:
@@ -849,9 +934,8 @@ def process_track(track_id, artist_name, album, track_name):
         if PREVIEW != 1:
             try:
                 nav_url = f"{NAV_BASE_URL}/rest/setRating?u={NAV_USER}&p=enc:{HEX_ENCODED_PASS}&v=1.12.0&c=myapp&id={track_id}&rating=0"
-                requests.get(nav_url, timeout=5)
-                LOCK[track_id] = time.time()
-                save_lock(LOCK)
+                navidrome_get(nav_url, f"updating rating for {track_id}")
+                record_lock(track_id, artist_name, album, track_name)
             except requests.exceptions.RequestException as e:
                 logging.error(f"Failed to update rating in Navidrome: {e}")
 
@@ -868,7 +952,12 @@ def process_album(album_id):
 
     SHOULD_DELAY = False
     nav_url = f"{NAV_BASE_URL}/rest/getAlbum?id={album_id}&u={NAV_USER}&p=enc:{HEX_ENCODED_PASS}&v=1.12.0&c=spotify_sync&f=json"
-    response = requests.get(nav_url).json()
+    try:
+        response = navidrome_get(nav_url, f"fetching album data for album {album_id}")
+        response = response.json()
+    except (requests.exceptions.RequestException, ValueError):
+        logging.exception(f"Failed to fetch album data for album {album_id}")
+        raise
 
     album_info = response["subsonic-response"]["album"]
     album_artist = album_info["artist"]
@@ -883,7 +972,12 @@ def process_album(album_id):
 
 def process_artist(artist_id):
     nav_url = f"{NAV_BASE_URL}/rest/getArtist?id={artist_id}&u={NAV_USER}&p=enc:{HEX_ENCODED_PASS}&v=1.12.0&c=spotify_sync&f=json"
-    response = requests.get(nav_url).json()
+    try:
+        response = navidrome_get(nav_url, f"fetching artist data for artist {artist_id}")
+        response = response.json()
+    except (requests.exceptions.RequestException, ValueError):
+        logging.exception(f"Failed to fetch artist data for artist {artist_id}")
+        raise
 
     albums = [
         (album["id"], album["name"])
@@ -897,7 +991,7 @@ def process_artist(artist_id):
 
 def fetch_data(url):
     try:
-        response = requests.get(url)
+        response = navidrome_get(url, "fetching Navidrome data")
         response_data = json.loads(response.text)
 
         if "subsonic-response" not in response_data:
